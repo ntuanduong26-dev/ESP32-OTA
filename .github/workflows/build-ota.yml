@@ -1,0 +1,167 @@
+name: Build and deploy ESP32 OTA
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Firmware version, for example 1.0.2"
+        required: true
+        type: string
+
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "github-pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Determine firmware version
+        id: fw
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version: $VERSION"
+            echo "Use a version such as 1.0.2"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building firmware version $VERSION"
+
+      - name: Generate version.h and secrets.h
+        env:
+          FW_VERSION: ${{ steps.fw.outputs.version }}
+          WIFI_SSID: ${{ secrets.WIFI_SSID }}
+          WIFI_PASSWORD: ${{ secrets.WIFI_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ.get("FW_VERSION", "")
+          ssid = os.environ.get("WIFI_SSID", "")
+          password = os.environ.get("WIFI_PASSWORD", "")
+
+          if not version:
+              raise SystemExit("FW_VERSION is empty")
+
+          if not ssid:
+              raise SystemExit("GitHub secret WIFI_SSID is missing")
+
+          if not password:
+              raise SystemExit("GitHub secret WIFI_PASSWORD is missing")
+
+          firmware_dir = Path("firmware")
+          firmware_dir.mkdir(parents=True, exist_ok=True)
+
+          (firmware_dir / "version.h").write_text(
+              "#pragma once\n\n"
+              f"#define FW_VERSION {json.dumps(version)}\n",
+              encoding="utf-8",
+          )
+
+          (firmware_dir / "secrets.h").write_text(
+              "#pragma once\n\n"
+              f"#define WIFI_SSID_VALUE {json.dumps(ssid)}\n"
+              f"#define WIFI_PASSWORD_VALUE {json.dumps(password)}\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 board package
+        run: |
+          ESP32_INDEX="https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+
+          arduino-cli core update-index \
+            --additional-urls "$ESP32_INDEX"
+
+          arduino-cli core install esp32:esp32@3.3.0 \
+            --additional-urls "$ESP32_INDEX"
+
+      - name: Compile ESP32 firmware
+        run: |
+          mkdir -p build
+
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32 \
+            --board-options "FlashSize=4M,PartitionScheme=default" \
+            --output-dir build \
+            firmware
+
+      - name: Prepare OTA files
+        env:
+          FW_VERSION: ${{ steps.fw.outputs.version }}
+        run: |
+          mkdir -p dist
+
+          cp build/firmware.ino.bin dist/firmware.bin
+          printf '%s\n' "$FW_VERSION" > dist/version.txt
+
+          touch dist/.nojekyll
+
+          SHA256=$(sha256sum dist/firmware.bin | awk '{print $1}')
+
+          cat > dist/index.html <<EOF
+          <!doctype html>
+          <html lang="vi">
+          <head>
+            <meta charset="utf-8">
+            <title>ESP32 OTA</title>
+          </head>
+          <body>
+            <h1>ESP32 OTA Firmware</h1>
+            <p>Version: $FW_VERSION</p>
+            <p>SHA-256: $SHA256</p>
+            <p><a href="firmware.bin">Download firmware.bin</a></p>
+          </body>
+          </html>
+          EOF
+
+          echo "Firmware information:"
+          ls -lh dist
+          sha256sum dist/firmware.bin
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Deploy firmware to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
