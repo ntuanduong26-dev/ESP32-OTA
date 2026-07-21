@@ -54,7 +54,7 @@ const int ledPins[] = {14, 27, 26, 25, 33};
 const int SO_LED =
   sizeof(ledPins) / sizeof(ledPins[0]);
 
-const unsigned long THOI_GIAN_CHAY = 1000;
+const unsigned long THOI_GIAN_CHAY = 30;
 
 // Trạng thái hiệu ứng LED
 int viTriLed = 0;
