@@ -1,75 +1,488 @@
 #include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
 #include <NetworkClientSecure.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
+
 #include "version.h"
-#include "secrets.h"
+#include "secrets.h"  // Chỉ dùng cho bản chuyển tiếp 1.0.2
 
 // =====================================================
-// Wi-Fi
+// OTA
 // =====================================================
-// const char* WIFI_SSID = "Ha Noi Med T4";
-// const char* WIFI_PASSWORD = "21156ltt";
-
-// // =====================================================
-// // Thông tin phiên bản và địa chỉ OTA
-// // =====================================================
-
-// // Phiên bản hiện đang chạy trong ESP32
-// // const char* CURRENT_VERSION = "1.0.0";
-// const char* CURRENT_VERSION = "1.0.1";
-const char* WIFI_SSID = WIFI_SSID_VALUE;
-const char* WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
 
 const char* CURRENT_VERSION = FW_VERSION;
 
-// GitHub Pages của bạn
 const char* VERSION_URL =
   "https://ntuanduong26-dev.github.io/ESP32-OTA/version.txt";
 
 const char* FIRMWARE_URL =
   "https://ntuanduong26-dev.github.io/ESP32-OTA/firmware.bin";
 
-// Sau khi bật ESP32, chờ 10 giây rồi kiểm tra lần đầu
-const unsigned long THOI_GIAN_CHO_KIEM_TRA_DAU = 10000;
-
-// Sau đó kiểm tra lại mỗi 5 phút
-const unsigned long CHU_KY_KIEM_TRA_OTA =
-  5UL * 60UL * 1000UL;
+const unsigned long OTA_CHECK_FIRST = 10000;
+const unsigned long OTA_CHECK_INTERVAL = 5UL * 60UL * 1000UL;
 
 // =====================================================
-// Cảm biến ánh sáng
+// Trang cấu hình Wi-Fi
 // =====================================================
+
+// ESP32 sẽ phát mạng này nếu chưa có Wi-Fi
+// hoặc không kết nối được Wi-Fi đã lưu.
+const char* CONFIG_AP_SSID = "ESP32-SETUP";
+const char* CONFIG_AP_PASSWORD = "12345678";
+
+const int CONFIG_BUTTON_PIN = 0;  // Nút BOOT
+
+Preferences preferences;
+WebServer configServer(80);
+
+bool configPortalActive = false;
+
+unsigned long buttonPressedAt = 0;
+bool buttonActionHandled = false;
+
+unsigned long wifiDisconnectedAt = 0;
+unsigned long lastReconnectAttempt = 0;
+
+// =====================================================
+// Cảm biến và LED
+// =====================================================
+
 const int CAM_BIEN_SANG = 21;
 
-// Cảm biến của bạn đang dùng:
-// trời tối D0 = HIGH
+const int ledPins[] = {14, 27, 26, 25, 33};
+const int SO_LED = sizeof(ledPins) / sizeof(ledPins[0]);
+
 const int TRANG_THAI_TOI = HIGH;
 
-// =====================================================
-// LED
-// =====================================================
-const int ledPins[] = {14, 27, 26, 25, 33};
+const unsigned long THOI_GIAN_CHAY = 100;
 
-const int SO_LED =
-  sizeof(ledPins) / sizeof(ledPins[0]);
-
-const unsigned long THOI_GIAN_CHAY = 30;
-
-// Trạng thái hiệu ứng LED
 int viTriLed = 0;
 int huongChay = 1;
-
 bool dangChayLed = false;
 
 unsigned long thoiGianLedTruoc = 0;
-unsigned long thoiGianKiemTraOTATruoc = 0;
-unsigned long thoiGianThuLaiWiFi = 0;
 
+// =====================================================
+// Bộ đếm OTA
+// =====================================================
+
+unsigned long thoiGianKiemTraOTATruoc = 0;
 bool daKiemTraOTALanDau = false;
 
 // =====================================================
-// Điều khiển LED
+// Lưu và đọc Wi-Fi trong NVS
+// =====================================================
+
+bool docWiFiTuNVS(String& ssid, String& password) {
+  preferences.begin("wifi-config", true);
+
+  ssid = preferences.getString("ssid", "");
+  password = preferences.getString("password", "");
+
+  preferences.end();
+
+  return ssid.length() > 0;
+}
+
+bool luuWiFiVaoNVS(
+  const String& ssid,
+  const String& password
+) {
+  if (ssid.length() == 0 || ssid.length() > 32) {
+    return false;
+  }
+
+  if (password.length() > 63) {
+    return false;
+  }
+
+  preferences.begin("wifi-config", false);
+
+  bool okSsid =
+    preferences.putString("ssid", ssid) > 0;
+
+  // Mạng mở có thể có mật khẩu rỗng nên không kiểm tra > 0
+  preferences.putString("password", password);
+
+  preferences.end();
+
+  return okSsid;
+}
+
+void xoaWiFiTrongNVS() {
+  preferences.begin("wifi-config", false);
+  preferences.clear();
+  preferences.end();
+
+  Serial.println("Da xoa cau hinh Wi-Fi trong NVS.");
+}
+
+// =====================================================
+// Chuyển Wi-Fi hiện tại vào NVS đúng một lần
+// =====================================================
+
+void chuyenWiFiHienTaiVaoNVS() {
+  String ssidDaLuu;
+  String passwordDaLuu;
+
+  // Nếu NVS đã có Wi-Fi thì không làm gì
+  if (docWiFiTuNVS(ssidDaLuu, passwordDaLuu)) {
+    Serial.print("NVS da co Wi-Fi: ");
+    Serial.println(ssidDaLuu);
+    return;
+  }
+
+  String ssidChuyenTiep = WIFI_SSID_VALUE;
+  String passwordChuyenTiep = WIFI_PASSWORD_VALUE;
+
+  if (ssidChuyenTiep.length() == 0) {
+    Serial.println("Khong co Wi-Fi chuyen tiep.");
+    return;
+  }
+
+  if (
+    luuWiFiVaoNVS(
+      ssidChuyenTiep,
+      passwordChuyenTiep
+    )
+  ) {
+    Serial.print("Da luu Wi-Fi hien tai vao NVS: ");
+    Serial.println(ssidChuyenTiep);
+  } else {
+    Serial.println("Khong luu duoc Wi-Fi vao NVS.");
+  }
+}
+
+// =====================================================
+// Trang cấu hình Wi-Fi
+// =====================================================
+
+String taoTrangCauHinhWiFi() {
+  String html;
+
+  html += R"HTML(
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1">
+  <title>Cấu hình Wi-Fi ESP32</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 460px;
+      margin: 40px auto;
+      padding: 20px;
+      background: #f4f4f4;
+    }
+
+    .box {
+      background: white;
+      padding: 24px;
+      border-radius: 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,.12);
+    }
+
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 12px;
+      margin: 7px 0 16px;
+      font-size: 16px;
+    }
+
+    button {
+      width: 100%;
+      padding: 13px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    .note {
+      color: #555;
+      font-size: 14px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="box">
+    <h2>Cấu hình Wi-Fi cho ESP32</h2>
+
+    <form method="POST" action="/save">
+      <label>Tên Wi-Fi</label>
+      <input
+        name="ssid"
+        maxlength="32"
+        required
+        autocomplete="off">
+
+      <label>Mật khẩu Wi-Fi</label>
+      <input
+        name="password"
+        type="password"
+        maxlength="63">
+
+      <button type="submit">
+        Lưu và kết nối
+      </button>
+    </form>
+
+    <p class="note">
+      Sau khi lưu, ESP32 sẽ khởi động lại và kết nối
+      vào mạng Wi-Fi vừa nhập.
+    </p>
+  </div>
+</body>
+</html>
+)HTML";
+
+  return html;
+}
+
+void xuLyTrangChu() {
+  configServer.send(
+    200,
+    "text/html; charset=utf-8",
+    taoTrangCauHinhWiFi()
+  );
+}
+
+void xuLyLuuWiFi() {
+  if (!configServer.hasArg("ssid")) {
+    configServer.send(
+      400,
+      "text/plain; charset=utf-8",
+      "Thiếu tên Wi-Fi."
+    );
+
+    return;
+  }
+
+  String ssid = configServer.arg("ssid");
+  String password = configServer.arg("password");
+
+  if (
+    ssid.length() == 0 ||
+    ssid.length() > 32 ||
+    password.length() > 63
+  ) {
+    configServer.send(
+      400,
+      "text/plain; charset=utf-8",
+      "Tên hoặc mật khẩu Wi-Fi không hợp lệ."
+    );
+
+    return;
+  }
+
+  if (!luuWiFiVaoNVS(ssid, password)) {
+    configServer.send(
+      500,
+      "text/plain; charset=utf-8",
+      "Không lưu được cấu hình Wi-Fi."
+    );
+
+    return;
+  }
+
+  configServer.send(
+    200,
+    "text/html; charset=utf-8",
+    R"HTML(
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1">
+</head>
+<body style="font-family:Arial;text-align:center;padding:40px">
+  <h2>Đã lưu Wi-Fi</h2>
+  <p>ESP32 đang khởi động lại...</p>
+</body>
+</html>
+)HTML"
+  );
+
+  Serial.print("Da nhan Wi-Fi moi: ");
+  Serial.println(ssid);
+
+  delay(1500);
+  ESP.restart();
+}
+
+void batTrangCauHinhWiFi() {
+  if (configPortalActive) {
+    return;
+  }
+
+  configPortalActive = true;
+
+  WiFi.disconnect();
+  delay(200);
+
+  WiFi.mode(WIFI_AP);
+
+  bool apStarted =
+    WiFi.softAP(
+      CONFIG_AP_SSID,
+      CONFIG_AP_PASSWORD
+    );
+
+  if (!apStarted) {
+    Serial.println("Khong bat duoc Wi-Fi cau hinh.");
+    return;
+  }
+
+  configServer.on("/", HTTP_GET, xuLyTrangChu);
+  configServer.on("/save", HTTP_POST, xuLyLuuWiFi);
+
+  configServer.onNotFound([]() {
+    configServer.sendHeader("Location", "/");
+    configServer.send(302, "text/plain", "");
+  });
+
+  configServer.begin();
+
+  Serial.println();
+  Serial.println("===== CHE DO CAU HINH WI-FI =====");
+
+  Serial.print("Ten Wi-Fi: ");
+  Serial.println(CONFIG_AP_SSID);
+
+  Serial.print("Mat khau: ");
+  Serial.println(CONFIG_AP_PASSWORD);
+
+  Serial.print("Mo trinh duyet tai: http://");
+  Serial.println(WiFi.softAPIP());
+
+  Serial.println("=================================");
+}
+
+// =====================================================
+// Kết nối Wi-Fi đã lưu
+// =====================================================
+
+bool ketNoiWiFiDaLuu() {
+  String ssid;
+  String password;
+
+  if (!docWiFiTuNVS(ssid, password)) {
+    Serial.println("NVS chua co thong tin Wi-Fi.");
+    return false;
+  }
+
+  Serial.print("Dang ket noi Wi-Fi: ");
+  Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  unsigned long batDau = millis();
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - batDau < 20000
+  ) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Khong ket noi duoc Wi-Fi da luu.");
+    return false;
+  }
+
+  WiFi.setSleep(false);
+
+  Serial.println("Da ket noi Wi-Fi.");
+
+  Serial.print("Dia chi IP: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("Phien ban hien tai: ");
+  Serial.println(CURRENT_VERSION);
+
+  return true;
+}
+
+void duyTriWiFi() {
+  if (
+    configPortalActive ||
+    WiFi.status() == WL_CONNECTED
+  ) {
+    wifiDisconnectedAt = 0;
+    return;
+  }
+
+  unsigned long hienTai = millis();
+
+  if (wifiDisconnectedAt == 0) {
+    wifiDisconnectedAt = hienTai;
+  }
+
+  if (
+    hienTai - lastReconnectAttempt >= 10000
+  ) {
+    lastReconnectAttempt = hienTai;
+
+    Serial.println("Thu ket noi lai Wi-Fi...");
+    WiFi.reconnect();
+  }
+
+  // Mất Wi-Fi liên tục 60 giây thì mở trang cấu hình
+  if (
+    hienTai - wifiDisconnectedAt >= 60000
+  ) {
+    Serial.println(
+      "Mat Wi-Fi qua lau. Bat che do cau hinh."
+    );
+
+    batTrangCauHinhWiFi();
+  }
+}
+
+// =====================================================
+// Giữ nút BOOT 5 giây để đổi Wi-Fi
+// =====================================================
+
+void xuLyNutCauHinh() {
+  bool dangNhan =
+    digitalRead(CONFIG_BUTTON_PIN) == LOW;
+
+  if (dangNhan) {
+    if (buttonPressedAt == 0) {
+      buttonPressedAt = millis();
+    }
+
+    if (
+      !buttonActionHandled &&
+      millis() - buttonPressedAt >= 5000
+    ) {
+      buttonActionHandled = true;
+
+      Serial.println();
+      Serial.println(
+        "Giu BOOT 5 giay: xoa Wi-Fi va mo cau hinh."
+      );
+
+      xoaWiFiTrongNVS();
+      batTrangCauHinhWiFi();
+    }
+  } else {
+    buttonPressedAt = 0;
+    buttonActionHandled = false;
+  }
+}
+
+// =====================================================
+// LED
 // =====================================================
 
 void tatTatCaLed() {
@@ -90,7 +503,6 @@ void capNhatHieuUngLed() {
   bool troiToi =
     digitalRead(CAM_BIEN_SANG) == TRANG_THAI_TOI;
 
-  // Trời sáng: tắt toàn bộ LED
   if (!troiToi) {
     tatTatCaLed();
 
@@ -101,7 +513,6 @@ void capNhatHieuUngLed() {
     return;
   }
 
-  // Vừa chuyển sang trời tối
   if (!dangChayLed) {
     dangChayLed = true;
 
@@ -114,20 +525,18 @@ void capNhatHieuUngLed() {
     return;
   }
 
-  // Dùng millis thay vì delay để chương trình không bị chặn
-  if (millis() - thoiGianLedTruoc >= THOI_GIAN_CHAY) {
+  if (
+    millis() - thoiGianLedTruoc >=
+    THOI_GIAN_CHAY
+  ) {
     thoiGianLedTruoc = millis();
 
     viTriLed += huongChay;
 
-    // Đến bên phải thì quay lại
     if (viTriLed >= SO_LED - 1) {
       viTriLed = SO_LED - 1;
       huongChay = -1;
-    }
-
-    // Đến bên trái thì chạy sang phải
-    else if (viTriLed <= 0) {
+    } else if (viTriLed <= 0) {
       viTriLed = 0;
       huongChay = 1;
     }
@@ -137,67 +546,7 @@ void capNhatHieuUngLed() {
 }
 
 // =====================================================
-// Kết nối Wi-Fi
-// =====================================================
-
-bool ketNoiWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    return true;
-  }
-
-  Serial.println();
-  Serial.print("Dang ket noi Wi-Fi: ");
-  Serial.println(WIFI_SSID);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  unsigned long batDau = millis();
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-
-    if (millis() - batDau >= 20000) {
-      Serial.println();
-      Serial.println("Khong ket noi duoc Wi-Fi.");
-
-      return false;
-    }
-  }
-
-  // Hạn chế Wi-Fi ngủ trong lúc tải firmware
-  WiFi.setSleep(false);
-
-  Serial.println();
-  Serial.println("Da ket noi Wi-Fi.");
-
-  Serial.print("Dia chi IP: ");
-  Serial.println(WiFi.localIP());
-
-  Serial.print("Phien ban hien tai: ");
-  Serial.println(CURRENT_VERSION);
-
-  return true;
-}
-
-void duyTriKetNoiWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    return;
-  }
-
-  // Thử kết nối lại mỗi 10 giây
-  if (millis() - thoiGianThuLaiWiFi >= 10000) {
-    thoiGianThuLaiWiFi = millis();
-
-    Serial.println("Wi-Fi bi mat. Dang ket noi lai...");
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  }
-}
-
-// =====================================================
-// Xử lý phiên bản
+// So sánh phiên bản
 // =====================================================
 
 bool tachPhienBan(
@@ -206,19 +555,13 @@ bool tachPhienBan(
   int& minor,
   int& patch
 ) {
-  major = 0;
-  minor = 0;
-  patch = 0;
-
-  int ketQua = sscanf(
+  return sscanf(
     version.c_str(),
     "%d.%d.%d",
     &major,
     &minor,
     &patch
-  );
-
-  return ketQua == 3;
+  ) == 3;
 }
 
 bool laPhienBanMoiHon(
@@ -233,23 +576,25 @@ bool laPhienBanMoiHon(
   int currentMinor;
   int currentPatch;
 
-  if (!tachPhienBan(
-        phienBanMoi,
-        newMajor,
-        newMinor,
-        newPatch
-      )) {
-    Serial.println("Phien ban tren server khong hop le.");
+  if (
+    !tachPhienBan(
+      phienBanMoi,
+      newMajor,
+      newMinor,
+      newPatch
+    )
+  ) {
     return false;
   }
 
-  if (!tachPhienBan(
-        phienBanHienTai,
-        currentMajor,
-        currentMinor,
-        currentPatch
-      )) {
-    Serial.println("CURRENT_VERSION khong hop le.");
+  if (
+    !tachPhienBan(
+      phienBanHienTai,
+      currentMajor,
+      currentMinor,
+      currentPatch
+    )
+  ) {
     return false;
   }
 
@@ -265,27 +610,15 @@ bool laPhienBanMoiHon(
 }
 
 // =====================================================
-// Đọc version.txt
+// Đọc phiên bản trên GitHub
 // =====================================================
 
 String docPhienBanTuServer() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return "";
-  }
-
   NetworkClientSecure client;
-
-  /*
-    Dùng để thử nghiệm:
-    vẫn mã hóa HTTPS nhưng không xác minh chứng chỉ server.
-
-    Sau khi chạy ổn, nên thay bằng Root CA để bảo mật đúng.
-  */
   client.setInsecure();
 
   HTTPClient http;
 
-  // Thêm tham số để hạn chế lấy file version.txt từ cache
   String url =
     String(VERSION_URL) +
     "?time=" +
@@ -295,24 +628,20 @@ String docPhienBanTuServer() {
   Serial.println(url);
 
   if (!http.begin(client, url)) {
-    Serial.println("Khong khoi tao duoc ket noi HTTPS.");
     return "";
   }
 
   http.setConnectTimeout(10000);
   http.setTimeout(10000);
 
-  // Cho phép theo redirect nếu server chuyển hướng
   http.setFollowRedirects(
     HTTPC_STRICT_FOLLOW_REDIRECTS
   );
 
-  http.addHeader("Cache-Control", "no-cache");
-
   int httpCode = http.GET();
 
   if (httpCode != HTTP_CODE_OK) {
-    Serial.print("Loi doc version.txt. HTTP code: ");
+    Serial.print("HTTP code: ");
     Serial.println(httpCode);
 
     http.end();
@@ -331,25 +660,22 @@ String docPhienBanTuServer() {
 }
 
 // =====================================================
-// Tải và cài firmware.bin
+// Cập nhật firmware
 // =====================================================
 
 void capNhatFirmware(const String& phienBanMoi) {
   Serial.println();
-  Serial.println("================================");
   Serial.println("BAT DAU CAP NHAT FIRMWARE");
+
   Serial.print("Tu phien ban: ");
   Serial.println(CURRENT_VERSION);
 
   Serial.print("Len phien ban: ");
   Serial.println(phienBanMoi);
-  Serial.println("================================");
 
   tatTatCaLed();
 
   NetworkClientSecure client;
-
-  // Chỉ dùng để thử nghiệm ban đầu
   client.setInsecure();
   client.setTimeout(20000);
 
@@ -360,86 +686,60 @@ void capNhatFirmware(const String& phienBanMoi) {
   );
 
   httpUpdate.onStart([]() {
-    Serial.println("Dang bat dau tai firmware...");
+    Serial.println("Dang tai firmware...");
   });
 
   httpUpdate.onProgress([](int current, int total) {
     if (total > 0) {
-      int phanTram =
+      int percent =
         static_cast<int>(
           (current * 100LL) / total
         );
 
       Serial.printf(
         "Tien trinh: %d%%\r",
-        phanTram
+        percent
       );
     }
   });
 
   httpUpdate.onEnd([]() {
     Serial.println();
-    Serial.println("Da ghi firmware thanh cong.");
-    Serial.println("ESP32 se khoi dong lai.");
+    Serial.println("Cap nhat thanh cong.");
   });
 
   httpUpdate.onError([](int error) {
     Serial.println();
-    Serial.print("Loi HTTP OTA: ");
+
+    Serial.print("Loi OTA: ");
     Serial.println(error);
 
-    Serial.print("Chi tiet: ");
     Serial.println(
-      httpUpdate
-        .getLastErrorString()
+      httpUpdate.getLastErrorString()
     );
   });
 
-  // Thêm version vào URL để hạn chế dùng firmware cũ từ cache
   String firmwareUrl =
     String(FIRMWARE_URL) +
     "?version=" +
     phienBanMoi;
 
-  Serial.print("Dang tai firmware tu: ");
-  Serial.println(firmwareUrl);
-
-  t_httpUpdate_return ketQua =
+  t_httpUpdate_return result =
     httpUpdate.update(
       client,
       firmwareUrl,
       CURRENT_VERSION
     );
 
-  switch (ketQua) {
-    case HTTP_UPDATE_FAILED:
-      Serial.println();
-      Serial.println("Cap nhat firmware that bai.");
-      break;
-
-    case HTTP_UPDATE_NO_UPDATES:
-      Serial.println();
-      Serial.println("Server bao khong co ban cap nhat.");
-      break;
-
-    case HTTP_UPDATE_OK:
-      /*
-        Thông thường không chạy tới đây vì ESP32
-        tự khởi động lại ngay sau khi cập nhật thành công.
-      */
-      Serial.println();
-      Serial.println("Cap nhat thanh cong.");
-      break;
+  if (result == HTTP_UPDATE_FAILED) {
+    Serial.println("Cap nhat that bai.");
+  } else if (result == HTTP_UPDATE_NO_UPDATES) {
+    Serial.println("Khong co ban cap nhat.");
   }
 }
 
-// =====================================================
-// Kiểm tra cập nhật
-// =====================================================
-
 void kiemTraCapNhatOTA() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Khong the kiem tra OTA vi mat Wi-Fi.");
     return;
   }
 
@@ -452,7 +752,6 @@ void kiemTraCapNhatOTA() {
   String phienBanServer = docPhienBanTuServer();
 
   if (phienBanServer.length() == 0) {
-    Serial.println("Khong doc duoc phien ban tu server.");
     return;
   }
 
@@ -463,14 +762,17 @@ void kiemTraCapNhatOTA() {
     )
   ) {
     Serial.println("Phat hien phien ban moi.");
+
     capNhatFirmware(phienBanServer);
   } else {
-    Serial.println("ESP32 dang o phien ban moi nhat.");
+    Serial.println(
+      "ESP32 dang o phien ban moi nhat."
+    );
   }
 }
 
 // =====================================================
-// Setup
+// Setup và loop
 // =====================================================
 
 void setup() {
@@ -478,10 +780,10 @@ void setup() {
   delay(500);
 
   pinMode(CAM_BIEN_SANG, INPUT);
+  pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
 
   for (int i = 0; i < SO_LED; i++) {
     pinMode(ledPins[i], OUTPUT);
-    digitalWrite(ledPins[i], LOW);
   }
 
   tatTatCaLed();
@@ -489,23 +791,32 @@ void setup() {
   Serial.println();
   Serial.println("ESP32 bat dau khoi dong.");
 
-  ketNoiWiFi();
+  // Chỉ có tác dụng chuyển tiếp ở phiên bản 1.0.2
+  chuyenWiFiHienTaiVaoNVS();
+
+  if (!ketNoiWiFiDaLuu()) {
+    batTrangCauHinhWiFi();
+  }
 }
 
-// =====================================================
-// Loop
-// =====================================================
-
 void loop() {
+  xuLyNutCauHinh();
   capNhatHieuUngLed();
-  duyTriKetNoiWiFi();
+
+  if (configPortalActive) {
+    configServer.handleClient();
+    delay(2);
+    return;
+  }
+
+  duyTriWiFi();
 
   unsigned long hienTai = millis();
 
-  // Kiểm tra OTA lần đầu sau 10 giây
   if (
+    WiFi.status() == WL_CONNECTED &&
     !daKiemTraOTALanDau &&
-    hienTai >= THOI_GIAN_CHO_KIEM_TRA_DAU
+    hienTai >= OTA_CHECK_FIRST
   ) {
     daKiemTraOTALanDau = true;
     thoiGianKiemTraOTATruoc = hienTai;
@@ -513,11 +824,11 @@ void loop() {
     kiemTraCapNhatOTA();
   }
 
-  // Kiểm tra lại định kỳ
   if (
+    WiFi.status() == WL_CONNECTED &&
     daKiemTraOTALanDau &&
-    hienTai - thoiGianKiemTraOTATruoc
-      >= CHU_KY_KIEM_TRA_OTA
+    hienTai - thoiGianKiemTraOTATruoc >=
+      OTA_CHECK_INTERVAL
   ) {
     thoiGianKiemTraOTATruoc = hienTai;
 
@@ -526,4 +837,3 @@ void loop() {
 
   delay(1);
 }
-
