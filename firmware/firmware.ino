@@ -56,7 +56,7 @@ const int SO_LED = sizeof(ledPins) / sizeof(ledPins[0]);
 
 const int TRANG_THAI_TOI = HIGH;
 
-const unsigned long THOI_GIAN_CHAY = 150;
+const unsigned long THOI_GIAN_CHAY = 30;
 
 int viTriLed = 0;
 int huongChay = 1;
